@@ -1,0 +1,13 @@
+{
+    "name": "auction-backend",
+    "version": "1.0.0",
+    "type": "module",
+    "scripts": {
+        "dev": "NODE_ENV=development node src/server.js",
+        "start": "node src/server.js"
+    },
+    "dependencies": {
+        "dayjs": "^1.11.13",
+        "pg": "^8.16.3"
+    }
+}
