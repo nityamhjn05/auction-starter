@@ -1,18 +1,25 @@
 // backend/src/routes/decisions.js
 import { Router } from 'express';
-import { Auction } from '../models/index.js';
+import { Auction, Notification } from '../models/index.js';
 import { redis } from '../redis.js';
 import { randomUUID } from 'crypto';
-import { sendEmail } from '../email.js';
 import { buildInvoice } from '../pdf.js';
+
+// Helper: save notification in DB and emit via socket
+async function notifyAndSave(io, userId, type, payload = {}) {
+  const id = randomUUID();
+  await Notification.create({ id, userId, type, payload });
+  io.to(`user:${userId}`).emit('notify', { id, userId, type, payload });
+}
 
 export default function makeDecisionRoutes(io){
   const r = Router();
 
   // SELLER decision: accept | reject | counter
   r.post('/:id/decision', async (req, res) => {
-    const { action, amount } = req.body;
+    const { action, amount } = req.body; // action: accept | reject | counter
     const auctionId = req.params.id;
+
     const a = await Auction.findByPk(auctionId);
     if(!a) return res.status(404).json({error:'Auction not found'});
 
@@ -23,45 +30,56 @@ export default function makeDecisionRoutes(io){
       a.status = 'closed';
       await a.save();
 
-      // socket notifs
-      io.to(`user:${highest.bidderId}`).emit('notify', { type:'accepted', auctionId, payload:{ amount: highest.amount } });
+      // Build invoice PDF (we keep “emails” as labels in PDF; they’re identifiers in this mode)
+      const invoiceBuf = await buildInvoice({
+        buyerEmail: `${highest.bidderId}`,
+        sellerEmail: `${a.sellerId}`,
+        itemName: a.itemName,
+        amount: highest.amount,
+        invoiceNo: randomUUID()
+      });
+      const invoiceBase64 = invoiceBuf.toString('base64');
 
-      // email + invoice
-      try{
-        const invoice = await buildInvoice({
-          buyerEmail: `${highest.bidderId}@example.com`,
-          sellerEmail: `${a.sellerId}@example.com`,
-          itemName: a.itemName,
-          amount: highest.amount,
-          invoiceNo: randomUUID()
-        });
-        const att = [{ content: invoice.toString('base64'), filename: 'invoice.pdf', type: 'application/pdf', disposition:'attachment' }];
-        await sendEmail({ to: `${highest.bidderId}@example.com`, subject: 'Bid accepted', text: `Your bid for ${a.itemName} is accepted. Amount: ₹${highest.amount}.`, attachments: att });
-        await sendEmail({ to: `${a.sellerId}@example.com`, subject: 'You accepted a bid', text: `You accepted a bid of ₹${highest.amount} for ${a.itemName}.`, attachments: att });
-      }catch(e){
-        console.error('[email:on-seller-accept]', e.message);
-      }
+      // Notify buyer + seller with invoice in payload
+      await notifyAndSave(io, highest.bidderId, 'accepted', {
+        auctionId,
+        amount: highest.amount,
+        message: `Your bid for ${a.itemName} was accepted.`,
+        invoiceBase64
+      });
+      await notifyAndSave(io, a.sellerId, 'accepted', {
+        auctionId,
+        amount: highest.amount,
+        message: `You accepted a bid of ₹${highest.amount} for ${a.itemName}.`,
+        invoiceBase64
+      });
 
       return res.json({ ok: true });
     }
-    
+
     if(action === 'reject'){
       a.status = 'closed';
       await a.save();
-      io.to(`user:${highest.bidderId}`).emit('notify', { type:'rejected', auctionId });
+      await notifyAndSave(io, highest.bidderId, 'rejected', {
+        auctionId,
+        message: `Your bid for ${a.itemName} was rejected.`
+      });
       return res.json({ ok: true });
     }
 
     if(action === 'counter'){
       if(!(amount > 0)) return res.status(400).json({error:'Amount required'});
-      // persist the counter
       await redis.set(`auction:${auctionId}:counter`, JSON.stringify({
         amount,
         sellerId: a.sellerId,
         bidderId: highest.bidderId
       }));
-      // notify top bidder
-      io.to(`user:${highest.bidderId}`).emit('notify', { type:'counter', auctionId, payload:{ amount } });
+      // in-app notify top bidder
+      await notifyAndSave(io, highest.bidderId, 'counter', {
+        auctionId,
+        amount,
+        message: `Seller countered ₹${amount} for ${a.itemName}.`
+      });
       return res.json({ ok: true });
     }
 
@@ -84,49 +102,47 @@ export default function makeDecisionRoutes(io){
     }
 
     if(action === 'accept'){
-      // close auction at the counter amount
       a.status = 'closed';
       await a.save();
       await redis.del(`auction:${auctionId}:counter`);
 
-      // socket notifs
-      io.to(`user:${counter.sellerId}`).emit('notify', { type:'counter_accepted', auctionId, payload:{ amount: counter.amount } });
-      io.to(`user:${bidderId}`).emit('notify', { type:'accepted', auctionId, payload:{ amount: counter.amount } });
+      // Build invoice for the counter amount
+      const invoiceBuf = await buildInvoice({
+        buyerEmail: `${bidderId}`,
+        sellerEmail: `${counter.sellerId}`,
+        itemName: a.itemName,
+        amount: counter.amount,
+        invoiceNo: randomUUID()
+      });
+      const invoiceBase64 = invoiceBuf.toString('base64');
 
-      // email + invoice (BUYER ACCEPTED COUNTER) ⭐
-      try{
-        const invoice = await buildInvoice({
-          buyerEmail: `${bidderId}@example.com`,
-          sellerEmail: `${counter.sellerId}@example.com`,
-          itemName: a.itemName,
-          amount: counter.amount,
-          invoiceNo: randomUUID()
-        });
-        const att = [{ content: invoice.toString('base64'), filename: 'invoice.pdf', type: 'application/pdf', disposition:'attachment' }];
-
-        await sendEmail({
-          to: `${bidderId}@example.com`,
-          subject: `Counter accepted for ${a.itemName}`,
-          text: `You accepted the seller's counter of ₹${counter.amount} for ${a.itemName}.`,
-          attachments: att
-        });
-        await sendEmail({
-          to: `${counter.sellerId}@example.com`,
-          subject: `Buyer accepted your counter for ${a.itemName}`,
-          text: `Your counter of ₹${counter.amount} for ${a.itemName} was accepted by ${bidderId}.`,
-          attachments: att
-        });
-      }catch(e){
-        console.error('[email:on-counter-accept]', e.message);
-      }
+      // notify both with invoice
+      await notifyAndSave(io, counter.sellerId, 'counter_accepted', {
+        auctionId,
+        amount: counter.amount,
+        message: `Buyer accepted your counter for ${a.itemName} at ₹${counter.amount}.`,
+        invoiceBase64
+      });
+      await notifyAndSave(io, bidderId, 'accepted', {
+        auctionId,
+        amount: counter.amount,
+        message: `You accepted the seller's counter for ${a.itemName} at ₹${counter.amount}.`,
+        invoiceBase64
+      });
 
       return res.json({ ok: true });
     }
 
     if(action === 'reject'){
       await redis.del(`auction:${auctionId}:counter`);
-      io.to(`user:${counter.sellerId}`).emit('notify', { type:'counter_rejected', auctionId });
-      io.to(`user:${bidderId}`).emit('notify', { type:'rejected', auctionId });
+      await notifyAndSave(io, counter.sellerId, 'counter_rejected', {
+        auctionId,
+        message: `Buyer rejected your counter for ${a.itemName}.`
+      });
+      await notifyAndSave(io, bidderId, 'rejected', {
+        auctionId,
+        message: `You rejected the seller's counter for ${a.itemName}.`
+      });
       return res.json({ ok: true });
     }
 
