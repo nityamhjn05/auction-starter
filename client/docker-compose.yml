@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  backend:
+    build: ./backend
+    container_name: auction-backend
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    restart: always
+
+  frontend:
+    build: ./client
+    container_name: auction-frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    restart: always
